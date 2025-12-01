@@ -1,0 +1,200 @@
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/wait.h>
+#include <string.h>
+#include <time.h>
+#include <sys/sem.h>
+
+#define MAX_LINES 5
+#define MAX_EXAM_SIZE 256
+#define MAX_RUBRIC_SIZE 256
+
+void P(int semid, int semnum) {
+    struct sembuf op = {semnum, -1, 0};
+    semop(semid, &op, 1);
+}
+
+void V(int semid, int semnum) {
+    struct sembuf op = {semnum, 1, 0};
+    semop(semid, &op, 1);
+}
+
+typedef struct {
+    char rubric[MAX_LINES][MAX_RUBRIC_SIZE];
+    char examContent[MAX_EXAM_SIZE];
+    int examDone;          // 1 if exma fully marked
+    int studentNumber;     // extracted from exam file (4digits student nmbr)
+    int currentQuestion;   // which question TAs should mark next
+    int examIndex;      // which exam file to load next
+} SharedData;
+
+void load_rubric(SharedData *data) {
+    FILE *f = fopen("rubric.txt", "r");
+    if (!f) { perror("rubric.txt"); exit(1); }
+
+    for (int i = 0; i < MAX_LINES; i++) {
+        fgets(data->rubric[i], MAX_RUBRIC_SIZE, f);
+        data->rubric[i][strcspn(data->rubric[i], "\n")] = '\0';
+    }
+    fclose(f);
+}
+
+void save_rubric(SharedData *data) {
+    FILE *f = fopen("rubric.txt", "w");
+    if (!f) { perror("rubric.txt"); exit(1); }
+
+    for (int i = 0; i < MAX_LINES; i++)
+        fprintf(f, "%s\n", data->rubric[i]);
+
+    fclose(f);
+}
+
+void load_exam(SharedData *data, char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) { perror("exam file"); exit(1); }
+
+    fgets(data->examContent, MAX_EXAM_SIZE, f);
+    data->examContent[strcspn(data->examContent, "\n")] = '\0';
+
+    data->studentNumber = atoi(data->examContent);
+    data->examDone = 0;
+    data->currentQuestion = 0;
+
+    fclose(f);
+}
+
+void TA_process(int id, SharedData *data, char examFiles[][32], int examCount, int semid) {
+
+    while (1) {
+
+        
+        P(semid, 2);  // lock exam loading section
+
+        int idx = data->examIndex;
+
+        if (idx >= examCount) {
+            V(semid, 2);
+            exit(0);
+        }
+
+        load_exam(data, examFiles[idx]);
+        data->examIndex++;
+
+        int stu = data->studentNumber;
+
+        printf("TA %d: Loaded exam for student %d\n", id, stu);
+        fflush(stdout);
+
+        if (stu == 9999) {
+            V(semid, 2);
+            printf("TA %d: Terminating (student 9999)\n", id);
+            exit(0);
+        }
+
+        V(semid, 2); 
+
+        // chedk rubric
+        for (int i = 0; i < MAX_LINES; i++) {
+            int needFix = rand() % 2; // random decision
+            usleep((500 + rand() % 500) * 1000); // 0.5–1.0 sec
+
+            if (needFix) {
+
+		P(semid, 0);
+
+                printf("TA %d: Correcting rubric line %d\n", id, i+1);
+                data->rubric[i][3] = data->rubric[i][3] + 1; // next ASCII char
+                save_rubric(data);
+
+		V(semid, 0);
+
+            } else {
+                printf("TA %d: Checked rubric line %d\n", id, i+1);
+            }
+        }
+
+        //marking
+        while (1) {
+
+            P(semid, 1);
+
+            int q = data->currentQuestion;
+            if (q >= MAX_LINES) {
+                V(semid, 1);
+                break;
+            }
+            data->currentQuestion++;
+
+            V(semid, 1);
+
+            printf("TA %d: Marking question %d for student %d\n", id, q+1, stu);
+            fflush(stdout);
+
+            usleep((1000 + rand() % 1000) * 1000); // 1–2 sec
+        }
+
+        printf("TA %d: Finished exam for student %d\n", id, stu);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <num_TAs>\n", argv[0]);
+        exit(1);
+    }
+
+    int numTAs = atoi(argv[1]);
+    if (numTAs < 2) {
+        fprintf(stderr, "Need at least 2 TAs.\n");
+        exit(1);
+    }
+
+    srand(time(NULL));
+
+    key_t key = ftok(".", 65);
+    int shmid = shmget(key, sizeof(SharedData), 0666 | IPC_CREAT);
+    SharedData *data = (SharedData *)shmat(shmid, NULL, 0);
+
+    load_rubric(data);
+    data->examIndex = 0;
+
+    // List exam files
+    char examFiles[20][32];
+    int examCount = 0;
+
+    for (int i = 1; i <= 20; i++) {
+        sprintf(examFiles[examCount], "exam_%04d.txt", i);
+        examCount++;
+    }
+
+    strcpy(examFiles[examCount], "exam_9999.txt");
+    examCount++;
+
+    int semid = semget(IPC_PRIVATE, 3, 0666 | IPC_CREAT);
+
+    semctl(semid, 0, SETVAL, 1); // rubric writing
+    semctl(semid, 1, SETVAL, 1); // question marking
+    semctl(semid, 2, SETVAL, 1); // exam loading
+
+
+    //Fork TA processes cuz multiple TA
+    for (int i = 0; i < numTAs; i++) {
+        if (fork() == 0) {
+            TA_process(i + 1, data, examFiles, examCount, semid);
+            exit(0);
+        }
+    }
+
+    for (int i = 0; i < numTAs; i++) wait(NULL);
+
+    shmdt(data);
+    shmctl(shmid, IPC_RMID, NULL);
+    semctl(semid, 0, IPC_RMID);
+
+    return 0;
+}
