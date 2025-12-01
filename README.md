@@ -132,6 +132,4 @@ shmctl(..., IPC_RMID)
 semctl(..., IPC_RMID)
 ```
 
-No manual cleanup is required.
-
 
